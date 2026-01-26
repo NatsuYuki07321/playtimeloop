@@ -2,6 +2,8 @@
 
 一個基於 Web 的輕量級倒數計時工具，允許使用者在同一頁面上同時管理與執行多個獨立的定時鬧鐘。支援自訂音檔、內建頻率合成音效（Beep）以及文字轉語音（TTS）功能。
 
+# 本程式完全以 Vide Code 進行
+
 ## ✨ 功能特點
 
 - **動態產生鬧鐘**：可自由設定鬧鐘數量（支援 1 至 24 個），介面會自動產生對應區塊。
@@ -41,4 +43,8 @@
 
 本專案為純靜態網頁，無需後端伺服器。
 
-1. 連線  http://natsuyuki07321.github.io/playtimeloop 使用 或下載此專案在本地環境直接使用瀏覽器開啟
+1. 連線  https://natsuyuki07321.github.io/playtimeloop 使用 或下載此專案在本地環境直接使用瀏覽器開啟
+
+2. 設定 (參考圖)
+![設定參考圖](https://natsuyuki07321.github.io/playtimeloop/example1.png)
+
