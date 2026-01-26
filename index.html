@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>多個定時鬧鐘</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="topbar container">
+    <h1>多個定時鬧鐘</h1>
+    <div class="row">
+      <label for="alarmCount">鬧鐘數量：</label>
+      <input type="number" id="alarmCount" min="1" max="24" value="2" />
+      <span class="hint">（輸入數字後會自動產生區塊；每個區塊可各自設定音檔與倒數時間）</span>
+    </div>
+  </div>
+
+  <div id="alarmsContainer" class="alarms-container"></div>
+
+  <!-- 完整的 UI 結構都放在 template，JS 只 clone 不動態建 DOM -->
+  <template id="alarmTemplate">
+    <div class="alarm-card" data-id="">
+      <div class="alarm-head">
+        <div class="title">鬧鐘 #<span class="alarm-index"></span></div>
+        <textarea class="note" placeholder="備註（語音會讀這裡的內容）"></textarea>
+      </div>
+
+      <div class="row">
+        <label>音效（MP3）：</label>
+        <input type="file" class="audio-file" accept="audio/*" />
+        <small class="hint">未選檔時會優先播放 <code>test-beep.mp3</code>；找不到則用內建蜂鳴或語音。</small>
+      </div>
+
+      <div class="row">
+        <label>倒數時間：</label>
+        <input type="number" class="mins" min="0" value="0" /> 分
+        <input type="number" class="secs" min="0" max="59" value="5" /> 秒
+      </div>
+
+      <div class="row gap">
+        <button class="start-btn">開始倒數</button>
+        <button class="stop-btn">結束倒數</button>
+      </div>
+
+      <div class="info">
+        <div>按下時間：<span class="start-at">—</span></div>
+        <div>觸發時間：<span class="target-at">—</span></div>
+        <div class="status">距離 <span class="target-at-inline">—</span> 還有 <span class="remain">—</span></div>
+      </div>
+
+      <!-- 自訂提醒區（全部以 HTML 表達；JS 僅讀值與綁定事件） -->
+      <div class="options">
+        <div class="row wave-row">
+          <label>蜂鳴波形：</label>
+          <label><input type="radio" class="wave-radio" data-group="wave" value="sine">sine</label>
+          <label><input type="radio" class="wave-radio" data-group="wave" value="square" checked>square</label>
+          <label><input type="radio" class="wave-radio" data-group="wave" value="sawtooth">sawtooth</label>
+          <label><input type="radio" class="wave-radio" data-group="wave" value="triangle">triangle</label>
+        </div>
+
+        <div class="row">
+          <label>音高(Hz)：</label>
+          <input type="range" class="freq-range" min="300" max="3000" step="1" value="1200" />
+          <span class="freq-val">1200</span>
+        </div>
+        <div class="row">
+          <label>每聲長度(ms)：</label>
+          <input type="range" class="len-range" min="20" max="400" step="5" value="90" />
+          <span class="len-val">90</span>
+        </div>
+        <div class="row">
+          <label>間隔(ms)：</label>
+          <input type="range" class="gap-range" min="0" max="200" step="5" value="60" />
+          <span class="gap-val">60</span>
+        </div>
+        <div class="row">
+          <label>音量(%)：</label>
+          <input type="range" class="vol-range" min="5" max="100" step="1" value="28" />
+          <span class="vol-val">28%</span>
+        </div>
+        <div class="row">
+          <label>次數(1~5)：</label>
+          <input type="range" class="times-range" min="1" max="5" step="1" value="2" />
+          <span class="times-val">2</span>
+        </div>
+
+        <div class="row">
+          <label class="tts-label"><input type="checkbox" class="tts-toggle" /> 使用語音提醒（讀備註）</label>
+          <button class="preview-tts-btn">試聽語音</button>
+          <button class="preview-beep-btn">試聽內建蜂鳴</button>
+        </div>
+      </div>
+
+      <div class="log-area"></div>
+      <audio class="audio" preload="auto" style="display:none;"></audio>
+    </div>
+  </template>
+
+  <script src="script.js"></script>
+</body>
+</html>

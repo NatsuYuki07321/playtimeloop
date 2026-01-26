@@ -1,0 +1,558 @@
+// 多個定時鬧鐘（循環 + 自訂蜂鳴/語音 + localStorage）
+// 職責：僅處理行為與資料；HTML 結構在 index.html 的 <template> 中；外觀在 style.css。
+
+const alarmsContainer = document.getElementById('alarmsContainer');
+const alarmCountInput = document.getElementById('alarmCount');
+const template = document.getElementById('alarmTemplate');
+
+/** 每個鬧鐘的內部狀態 */
+const state = new Map(); // id -> { timeoutId, intervalId, target, periodMs, objectUrl, running, runId }
+let nextId = 1;
+
+/* ===================== localStorage Helpers ===================== */
+const LS_COUNT_KEY = 'alarm:count';
+const lsKey = (id, prop) => `alarm:${id}:${prop}`;
+const ls = {
+  getNum(key, defVal) {
+    const v = localStorage.getItem(key);
+    const n = Number(v);
+    return Number.isFinite(n) ? n : defVal;
+  },
+  getStr(key, defVal) {
+    const v = localStorage.getItem(key);
+    return v == null ? defVal : v;
+  },
+  set(key, val) { localStorage.setItem(key, String(val)); },
+};
+
+/* ===================== 小工具 ===================== */
+function pad2(n) { return n.toString().padStart(2, '0'); }
+function mmss(ms) {
+  if (ms < 0) ms = 0;
+  const sec = Math.floor(ms / 1000);
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${pad2(m)}:${pad2(s)}`;
+}
+
+/** 讓狀態行維持固定骨架（避免用 textContent 把 span 清掉） */
+function setStatusLine(card, labelText) {
+  const statusEl = card.querySelector('.status');
+  if (!statusEl) return;
+  statusEl.innerHTML = `${labelText}｜距離 <span class="target-at-inline">—</span> 還有 <span class="remain">—</span>`;
+}
+
+/* ===================== Web Audio: 內建蜂鳴 ===================== */
+let audioCtx = null;
+function ensureAudioCtx() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new AC();
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+
+/**
+ * 依設定播放嗶聲（1~5 聲）。不自動限縮總時長。
+ * @param {number} ms  單聲名目長度（毫秒），UI 會限制 ≤ 400
+ * @param {number} freq 第一聲頻率（Hz）
+ * @param {object} opts { wave, gapMs, volume, times, freq2Delta, attack, release }
+ */
+async function webBeep(ms = 90, freq = 1200, opts = {}) {
+  const ctx = ensureAudioCtx();
+
+  let times      = Math.max(1, Math.min(5, opts.times ?? 2));
+  let gapSec     = Math.max(0, (opts.gapMs ?? 60) / 1000);
+  const wave     = opts.wave ?? 'square';
+  const volume   = Math.max(0.01, Math.min(0.6, opts.volume ?? 0.28));
+  const f1       = freq;
+  const f2Delta  = opts.freq2Delta ?? 300;
+  const attack   = Math.max(0.001, opts.attack ?? 0.003);
+  const release  = Math.max(0.01,  opts.release ?? 0.025);
+
+  let beepSec = Math.max(0.02, Math.min(0.4, ms / 1000));
+  const hold  = Math.max(0, beepSec - attack - release);
+  const startAt = ctx.currentTime + 0.01;
+
+  function scheduleOneBeep(t0, hz) {
+    const osc  = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = wave;
+    osc.frequency.setValueAtTime(hz, t0);
+
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(volume, t0 + attack);
+    gain.gain.setValueAtTime(volume, t0 + attack + hold);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + attack + hold + release);
+
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(t0);
+    osc.stop(t0 + attack + hold + release);
+    osc.onended = () => { try { osc.disconnect(); gain.disconnect(); } catch (_) {} };
+  }
+
+  for (let i = 0; i < times; i++) {
+    const t = startAt + i * (beepSec + (i === 0 ? 0 : gapSec));
+    const hz = i === 0 ? f1 : f1 + f2Delta;
+    scheduleOneBeep(t, hz);
+  }
+
+  const totalSec = times * beepSec + (times - 1) * gapSec;
+  return new Promise(res => setTimeout(res, totalSec * 1000));
+}
+
+/* ===================== Web Speech: 語音提醒（讀備註） ===================== */
+
+function canUseTTS() {
+  return 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
+}
+
+function waitForVoices() {
+  return new Promise((res) => {
+    const has = speechSynthesis.getVoices();
+    if (has && has.length) return res();
+    const timer = setTimeout(res, 600);
+    const onV = () => { clearTimeout(timer); speechSynthesis.removeEventListener('voiceschanged', onV); res(); };
+    speechSynthesis.addEventListener('voiceschanged', onV);
+  });
+}
+
+function pickVoice(langPref) {
+  const voices = speechSynthesis.getVoices() || [];
+  if (!voices.length) return null;
+  const lang = (langPref || navigator.language || 'zh-TW').toLowerCase();
+  const exact = voices.find(v => v.lang && v.lang.toLowerCase().startsWith(lang));
+  const zhAny = voices.find(v => v.lang && v.lang.toLowerCase().startsWith('zh'));
+  return exact || zhAny || voices[0];
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function speakOnce(text, { rate = 1, pitch = 1, volume = 1, lang } = {}) {
+  await waitForVoices();
+  return new Promise((resolve) => {
+    try {
+      const u = new SpeechSynthesisUtterance(text);
+      const v = pickVoice(lang);
+      if (v) u.voice = v;
+      u.rate = rate;
+      u.pitch = pitch;
+      u.volume = Math.max(0, Math.min(1, volume));
+      u.onend = () => resolve();
+      u.onerror = () => resolve(); // 不阻塞倒數
+      speechSynthesis.cancel();    // 避免重疊
+      speechSynthesis.speak(u);
+    } catch (_) { resolve(); }
+  });
+}
+
+/** 讀出備註（空白則讀「時間到了」），可重複 times 次，間隔 gapMs */
+async function speakNote(card, times, gapMs, volumePct = 100) {
+  if (!canUseTTS()) throw new Error('TTS not supported');
+  const note = card.querySelector('textarea.note')?.value?.trim() || '';
+  const msg = note ? `${note}，時間到了。` : '時間到了。';
+  const vol = Math.max(0, Math.min(1, (volumePct || 100) / 100));
+  for (let i = 0; i < times; i++) {
+    await speakOnce(msg, { rate: 1, pitch: 1, volume: vol, lang: 'zh-TW' });
+    if (i < times - 1) await sleep(Math.max(0, gapMs || 0));
+  }
+}
+
+/* ===================== UI 建立（clone template） ===================== */
+
+function createAlarmCard(withId = null) {
+  const id = withId ?? nextId++;
+  const frag = template.content.cloneNode(true);
+  const card = frag.querySelector('.alarm-card');
+  card.dataset.id = String(id);
+  card.querySelector('.alarm-index').textContent = String(id);
+
+  // 確保每張卡片的波形 radio 不互搶（依 id 設定 name）
+  for (const r of card.querySelectorAll('input.wave-radio[data-group="wave"]')) {
+    r.setAttribute('name', `wave-${id}`);
+  }
+
+  alarmsContainer.appendChild(frag);
+
+  // 初始化狀態容器（含 runId）
+  state.set(id, {
+    timeoutId: null,
+    intervalId: null,
+    target: null,
+    periodMs: null,
+    objectUrl: null,
+    running: false,
+    runId: 0,
+  });
+
+  // 還原此卡片設定
+  restoreCardSettings(id, findCard(id));
+}
+
+function destroyAlarmCard(card) {
+  const id = Number(card.dataset.id);
+  stopAlarm(id);
+  state.delete(id);
+  card.remove();
+}
+
+function findCard(id) {
+  return alarmsContainer.querySelector(`.alarm-card[data-id="${id}"]`);
+}
+
+/* ===================== 事件委派 ===================== */
+
+function saveCountToLS() {
+  const want = Math.max(1, Math.min(24, Number(alarmCountInput.value || 1)));
+  ls.set(LS_COUNT_KEY, want);
+}
+
+alarmsContainer.addEventListener('input', (ev) => {
+  const card = ev.target.closest('.alarm-card');
+  if (!card) return;
+  const id = Number(card.dataset.id);
+
+  // 備註
+  if (ev.target.matches('textarea.note')) {
+    ls.set(lsKey(id, 'note'), ev.target.value);
+  }
+
+  // range：freq/len/gap/vol/times
+  if (ev.target.matches('.freq-range, .len-range, .gap-range, .vol-range, .times-range')) {
+    const map = [
+      ['freq-range','freq',''],
+      ['len-range','len',''],
+      ['gap-range','gap',''],
+      ['vol-range','vol','%'],
+      ['times-range','times','']
+    ];
+    for (const [cls, prop, suffix] of map) {
+      if (ev.target.classList.contains(cls)) {
+        let val = Number(ev.target.value);
+        if (prop === 'len')   val = Math.max(20, Math.min(400, val)); // 每聲 ≤ 400ms
+        if (prop === 'times') val = Math.max(1, Math.min(5, val));    // 次數 1~5
+        ls.set(lsKey(id, prop), val);
+        const span = card.querySelector(`.${prop}-val`);
+        if (span) span.textContent = suffix ? `${val}${suffix}` : String(val);
+      }
+    }
+  }
+
+  // 倒數分秒：即時保存與校正
+  if (ev.target.matches('.mins, .secs')) {
+    const minsEl = card.querySelector('.mins');
+    const secsEl = card.querySelector('.secs');
+    let mins = parseInt(minsEl.value, 10);
+    let secs = parseInt(secsEl.value, 10);
+    if (!Number.isFinite(mins) || mins < 0) mins = 0;
+    if (!Number.isFinite(secs) || secs < 0) secs = 0;
+    if (secs > 59) secs = 59;
+    minsEl.value = String(mins);
+    secsEl.value = String(secs);
+    ls.set(lsKey(id, 'mins'), mins);
+    ls.set(lsKey(id, 'secs'), secs);
+  }
+
+  // 語音開關（checkbox 也會觸發 input）
+  if (ev.target.matches('.tts-toggle')) {
+    ls.set(lsKey(id, 'tts'), ev.target.checked ? 1 : 0);
+  }
+});
+
+alarmsContainer.addEventListener('change', (ev) => {
+  const card = ev.target.closest('.alarm-card');
+  if (!card) return;
+  const id = Number(card.dataset.id);
+
+  // 波形 radio
+  if (ev.target.matches('.wave-radio')) {
+    const wave = card.querySelector(`input[name="wave-${id}"]:checked`)?.value ?? 'square';
+    ls.set(lsKey(id, 'wave'), wave);
+  }
+});
+
+alarmsContainer.addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button');
+  if (!btn) return;
+  const card = ev.target.closest('.alarm-card');
+  if (!card) return;
+  const id = Number(card.dataset.id);
+
+  if (btn.classList.contains('preview-beep-btn')) {
+    try { ensureAudioCtx(); } catch (_) {}
+    const s = readBeepSettings(card, id);
+    await webBeep(s.len, s.freq, {
+      wave: s.wave, gapMs: s.gap, volume: s.vol / 100,
+      times: s.times, freq2Delta: 300,
+    });
+    return;
+  }
+
+  if (btn.classList.contains('preview-tts-btn')) {
+    if (!canUseTTS()) { alert('此瀏覽器不支援語音合成'); return; }
+    const s = readBeepSettings(card, id);
+    await speakNote(card, s.times, s.gap, s.vol);
+    return;
+  }
+
+  if (btn.classList.contains('start-btn')) {
+    try { ensureAudioCtx(); } catch (_) {}
+    handleStart(id);
+  } else if (btn.classList.contains('stop-btn')) {
+    stopAlarm(id);
+  }
+});
+
+/* ===================== 讀寫卡片設定 ===================== */
+
+function restoreCardSettings(id, card) {
+  // 狀態列骨架先建好，避免被清空 span
+  setStatusLine(card, '就緒');
+
+  // 備註
+  const noteVal = ls.getStr(lsKey(id, 'note'), '');
+  card.querySelector('textarea.note').value = noteVal;
+
+  // 波形
+  const savedWave = ls.getStr(lsKey(id, 'wave'), 'square');
+  const radio = card.querySelector(`input[name="wave-${id}"][value="${savedWave}"]`);
+  if (radio) radio.checked = true;
+
+  // 拖拉條 + 次數
+  const freq  = ls.getNum(lsKey(id, 'freq'), 1200);
+  const len   = Math.max(20, Math.min(400, ls.getNum(lsKey(id, 'len'), 90)));
+  const gap   = Math.max(0, ls.getNum(lsKey(id, 'gap'), 60));
+  const vol   = ls.getNum(lsKey(id, 'vol'), 28);
+  const times = Math.max(1, Math.min(5, ls.getNum(lsKey(id, 'times'), 2)));
+
+  const set = (cls, val, fmt) => {
+    const inp = card.querySelector(`.${cls}-range`);
+    const sp  = card.querySelector(`.${cls}-val`);
+    if (inp) inp.value = String(val);
+    if (sp)  sp.textContent = fmt ? fmt(val) : (cls === 'vol' ? `${val}%` : String(val));
+  };
+  set('freq', freq);
+  set('len',  len);
+  set('gap',  gap);
+  set('vol',  vol, v => `${v}%`);
+  set('times', times);
+
+  // 倒數分秒（預設 0 分 5 秒）
+  const mins = Math.max(0, ls.getNum(lsKey(id, 'mins'), 0));
+  const secs = Math.max(0, Math.min(59, ls.getNum(lsKey(id, 'secs'), 5)));
+  card.querySelector('.mins').value = String(mins);
+  card.querySelector('.secs').value = String(secs);
+
+  // 語音開關
+  const tts = ls.getNum(lsKey(id, 'tts'), 0) === 1;
+  card.querySelector('.tts-toggle').checked = tts;
+}
+
+function readBeepSettings(card, id) {
+  const wave  = card.querySelector(`input[name="wave-${id}"]:checked`)?.value ?? 'square';
+  const freq  = Number(card.querySelector('.freq-range')?.value ?? 1200);
+  const len   = Math.max(20, Math.min(400, Number(card.querySelector('.len-range')?.value  ?? 90)));
+  const gap   = Math.max(0, Number(card.querySelector('.gap-range')?.value  ?? 60));
+  const vol   = Number(card.querySelector('.vol-range')?.value  ?? 28);
+  const times = Math.max(1, Math.min(5, Number(card.querySelector('.times-range')?.value ?? 2)));
+  const tts   = card.querySelector('.tts-toggle')?.checked ?? false;
+  return { wave, freq, len, gap, vol, times, tts };
+}
+
+/* ===================== 倒數核心（runId 防舊回呼） ===================== */
+
+function clearTimers(id) {
+  const st = state.get(id);
+  if (!st) return;
+  if (st.timeoutId) { clearTimeout(st.timeoutId); st.timeoutId = null; }
+  if (st.intervalId) { clearInterval(st.intervalId); st.intervalId = null; }
+}
+
+function stopAlarm(id) {
+  const st = state.get(id);
+  if (!st) return;
+
+  // 使所有仍在路上的回呼失效
+  st.runId++;
+  st.running = false;
+  clearTimers(id);
+
+  // 取消語音播放隊列
+  try { if (canUseTTS()) speechSynthesis.cancel(); } catch (_) {}
+
+  const card = findCard(id);
+  if (!card) return;
+
+  // 停止音效
+  const audio = card.querySelector('.audio');
+  try { audio.pause(); audio.currentTime = 0; } catch (_) {}
+
+  // 重置狀態
+  st.target = null;
+  st.periodMs = null;
+
+  // 重建狀態行骨架（不要用 textContent 清空）
+  setStatusLine(card, '已取消倒數');
+
+  // 其他欄位歸零
+  card.querySelector('.start-at').textContent = '—';
+  card.querySelector('.target-at').textContent = '—';
+  card.querySelector('.target-at-inline').textContent = '—';
+  card.querySelector('.remain').textContent = '—';
+}
+
+function scheduleNextTrigger(id) {
+  const st = state.get(id);
+  if (!st || !st.running || !st.target || !st.periodMs) return;
+  const card = findCard(id);
+  if (!card) return;
+
+  const myRun = st.runId; // 捕捉本輪 runId
+  const audio = card.querySelector('.audio');
+  const targetAtEl = card.querySelector('.target-at');
+  const targetInline = card.querySelector('.target-at-inline');
+  const log = card.querySelector('.log-area');
+
+  const delay = Math.max(0, st.target.getTime() - Date.now());
+  st.timeoutId = setTimeout(async () => {
+    const cur = state.get(id);
+    if (!cur || !cur.running || cur.runId !== myRun) return;
+
+    // 依優先序播放：上傳音檔 -> 語音（若啟用）-> 內建蜂鳴
+    let played = false;
+    if (audio.src) {
+      try { audio.currentTime = 0; await audio.play(); played = true; } catch (_) { played = false; }
+    }
+    if (!played) {
+      const s = readBeepSettings(card, id);
+      if (s.tts && canUseTTS()) {
+        try { await speakNote(card, s.times, s.gap, s.vol); played = true; } catch (_) {}
+      }
+    }
+    if (!played) {
+      const s = readBeepSettings(card, id);
+      try {
+        await webBeep(s.len, s.freq, {
+          wave: s.wave, gapMs: s.gap, volume: s.vol/100,
+          times: s.times, freq2Delta: 300
+        });
+      } catch (_) {}
+    }
+
+    // 若中途被停止（runId 變了），就不要再排下一輪或寫 UI
+    const cur2 = state.get(id);
+    if (!cur2 || !cur2.running || cur2.runId !== myRun) return;
+
+    // Log
+    const div = document.createElement('div');
+    div.textContent = `🔔 觸發播放：${new Date().toLocaleString()}`;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+
+    // 下一輪（持續循環直到手動停止）
+    cur2.target = new Date(cur2.target.getTime() + cur2.periodMs);
+    if (targetAtEl) targetAtEl.textContent = cur2.target.toLocaleTimeString();
+    if (targetInline) targetInline.textContent = cur2.target.toLocaleTimeString();
+
+    scheduleNextTrigger(id);
+  }, delay);
+}
+
+function handleStart(id) {
+  const card = findCard(id);
+  if (!card) return;
+
+  // 開始前清掉任何語音佇列（避免上一輪殘留）
+  try { if (canUseTTS()) speechSynthesis.cancel(); } catch (_) {}
+
+  // 讀 & 校正 使用者輸入的分/秒
+  const minsEl = card.querySelector('.mins');
+  const secsEl = card.querySelector('.secs');
+  let mins = parseInt(minsEl.value, 10);
+  let secs = parseInt(secsEl.value, 10);
+  if (!Number.isFinite(mins) || mins < 0) mins = 0;
+  if (!Number.isFinite(secs) || secs < 0) secs = 0;
+  if (secs > 59) secs = 59;
+
+  // 回寫 + 保存到 LS
+  minsEl.value = String(mins);
+  secsEl.value = String(secs);
+  ls.set(lsKey(id, 'mins'), mins);
+  ls.set(lsKey(id, 'secs'), secs);
+
+  const total = (mins * 60 + secs) * 1000;
+  if (!Number.isFinite(total) || total <= 0) {
+    alert('請輸入大於 0 的倒數時間！');
+    return;
+  }
+
+  const st = state.get(id);
+  if (!st) return;
+
+  // 使上一輪回呼失效 & 清舊計時器
+  st.runId++;
+  clearTimers(id);
+
+  // 設定音效來源
+  const input = card.querySelector('.audio-file');
+  const audio = card.querySelector('.audio');
+  try { audio.pause(); audio.currentTime = 0; } catch (_) {}
+  if (input.files && input.files[0]) {
+    if (st.objectUrl) { try { URL.revokeObjectURL(st.objectUrl); } catch (_) {} }
+    st.objectUrl = URL.createObjectURL(input.files[0]);
+    audio.src = st.objectUrl;
+  } else if (st.objectUrl) {
+    audio.src = st.objectUrl;
+  } else {
+    audio.src = 'test-beep.mp3'; // 若不存在，scheduleNextTrigger 會自動 fallback
+  }
+
+  // 記錄時間
+  const now = new Date();
+  st.running = true;
+  st.periodMs = total;
+  st.target = new Date(now.getTime() + total);
+
+  // 狀態列骨架 + 初始值
+  setStatusLine(card, '倒數中（循環）');
+  card.querySelector('.start-at').textContent = now.toLocaleTimeString();
+  card.querySelector('.target-at').textContent = st.target.toLocaleTimeString();
+  card.querySelector('.target-at-inline').textContent = st.target.toLocaleTimeString();
+  card.querySelector('.remain').textContent = mmss(total);
+
+  // UI 倒數顯示
+  st.intervalId = setInterval(() => {
+    const cur = state.get(id);
+    if (!cur || !cur.running || !cur.target) return;
+    const diff = cur.target.getTime() - Date.now();
+    const remainEl = card.querySelector('.remain');
+    if (remainEl) remainEl.textContent = mmss(diff);
+  }, 200);
+
+  // 安排第一個觸發
+  scheduleNextTrigger(id);
+}
+
+/* ===================== 卡片數量維護 ===================== */
+function reconcileCards() {
+  const want = Math.max(1, Math.min(24, Number(alarmCountInput.value || 1)));
+  const current = alarmsContainer.querySelectorAll('.alarm-card').length;
+  if (current < want) {
+    for (let i = current + 1; i <= want; i++) createAlarmCard(i);
+  } else if (current > want) {
+    const cards = Array.from(alarmsContainer.querySelectorAll('.alarm-card'));
+    for (let i = cards.length - 1; i >= want; i--) destroyAlarmCard(cards[i]);
+  }
+  ls.set(LS_COUNT_KEY, want);
+}
+
+/* ===================== 初始化 ===================== */
+const savedCount = ls.getNum(LS_COUNT_KEY, Number(alarmCountInput.value || 2));
+alarmCountInput.value = Math.max(1, Math.min(24, savedCount));
+reconcileCards();
+
+alarmCountInput.addEventListener('input', () => {
+  reconcileCards();
+  saveCountToLS();
+});
